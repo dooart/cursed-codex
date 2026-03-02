@@ -42,8 +42,12 @@ echo "     Checked out: $(git rev-parse HEAD)"
 
 # --- 3. Patch ---
 if [ -f "$REPO_ROOT/patches/event-tap.patch" ]; then
-  echo "[3/4] Applying event-tap patch..."
-  git apply "$REPO_ROOT/patches/event-tap.patch"
+  if git apply --check "$REPO_ROOT/patches/event-tap.patch" 2>/dev/null; then
+    echo "[3/4] Applying event-tap patch..."
+    git apply "$REPO_ROOT/patches/event-tap.patch"
+  else
+    echo "[3/4] Patch already applied, skipping..."
+  fi
 else
   echo "[3/4] No patch file yet, skipping (vanilla build)"
 fi
