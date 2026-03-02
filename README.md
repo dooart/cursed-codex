@@ -4,7 +4,7 @@ An AI sports commentator that watches [OpenAI Codex](https://github.com/openai/c
 
 Errors are red cards. Passing tests are goals. The AI agent is "the lad."
 
-[![Demo](demo.jpg)](https://www.youtube.com/watch?v=6WIBpcpSxww)
+[![Demo](demo-thumb.jpg)](https://www.youtube.com/watch?v=6WIBpcpSxww)
 
 ## How it works
 
