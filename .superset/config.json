@@ -1,0 +1,4 @@
+{
+  "setup": ["bun install", "cp \"$SUPERSET_ROOT_PATH/.env\" .env"],
+  "teardown": []
+}

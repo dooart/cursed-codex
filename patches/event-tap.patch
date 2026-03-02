@@ -1,0 +1,249 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 62d459f..d452ec4 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -584,6 +584,8 @@ pub(crate) struct App {
+     pub(crate) commit_anim_running: Arc<AtomicBool>,
+     // Shared across ChatWidget instances so invalid status-line config warnings only emit once.
+     status_line_invalid_items_warned: Arc<AtomicBool>,
++    // Broadcast sender for the event-tap WebSocket side-channel.
++    tap_tx: broadcast::Sender<String>,
+ 
+     // Esc-backtracking state grouped
+     pub(crate) backtrack: crate::app_backtrack::BacktrackState,
+@@ -669,6 +671,7 @@ impl App {
+             model: Some(self.chat_widget.current_model().to_string()),
+             status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
+             otel_manager: self.otel_manager.clone(),
++            tap_tx: self.tap_tx.clone(),
+         }
+     }
+ 
+@@ -1195,6 +1198,7 @@ impl App {
+             model: Some(model),
+             status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
+             otel_manager: self.otel_manager.clone(),
++            tap_tx: self.tap_tx.clone(),
+         };
+         self.chat_widget = ChatWidget::new(init, self.server.clone());
+         self.reset_thread_event_state();
+@@ -1311,6 +1315,57 @@ impl App {
+         let (app_event_tx, mut app_event_rx) = unbounded_channel();
+         let app_event_tx = AppEventSender::new(app_event_tx);
+         emit_project_config_warnings(&app_event_tx, &config);
++
++        // --- Event-tap TCP side-channel (newline-delimited JSON) ---
++        let (tap_tx, _tap_rx) = broadcast::channel::<String>(256);
++        {
++            let tap_tx_for_server = tap_tx.clone();
++            let tap_port: u16 = std::env::var("CODEX_TAP_PORT")
++                .ok()
++                .and_then(|v| v.parse().ok())
++                .unwrap_or(4222);
++            tokio::spawn(async move {
++                let addr = format!("127.0.0.1:{tap_port}");
++                let listener = match tokio::net::TcpListener::bind(&addr).await {
++                    Ok(l) => l,
++                    Err(e) => {
++                        tracing::warn!("event-tap: failed to bind {addr}: {e}");
++                        return;
++                    }
++                };
++                // Write connection info so the sidecar can discover us.
++                if let Some(codex_home) = dirs::home_dir() {
++                    let sock_path = codex_home.join(".codex").join("commentator.sock");
++                    let _ = std::fs::create_dir_all(sock_path.parent().unwrap());
++                    let _ = std::fs::write(&sock_path, format!("tcp://127.0.0.1:{tap_port}"));
++                }
++                tracing::info!("event-tap: listening on {addr}");
++                loop {
++                    let (stream, _) = match listener.accept().await {
++                        Ok(c) => c,
++                        Err(_) => continue,
++                    };
++                    let mut rx = tap_tx_for_server.subscribe();
++                    tokio::spawn(async move {
++                        use tokio::io::AsyncWriteExt;
++                        let (_, mut writer) = stream.into_split();
++                        loop {
++                            match rx.recv().await {
++                                Ok(msg) => {
++                                    let mut line = msg.into_bytes();
++                                    line.push(b'\n');
++                                    if writer.write_all(&line).await.is_err() {
++                                        break;
++                                    }
++                                }
++                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
++                                Err(broadcast::error::RecvError::Closed) => break,
++                            }
++                        }
++                    });
++                }
++            });
++        }
+         tui.set_notification_method(config.tui_notification_method);
+ 
+         let harness_overrides =
+@@ -1411,6 +1466,7 @@ impl App {
+                     model: Some(model.clone()),
+                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                     otel_manager: otel_manager.clone(),
++                    tap_tx: tap_tx.clone(),
+                 };
+                 ChatWidget::new(init, thread_manager.clone())
+             }
+@@ -1441,6 +1497,7 @@ impl App {
+                     model: config.model.clone(),
+                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                     otel_manager: otel_manager.clone(),
++                    tap_tx: tap_tx.clone(),
+                 };
+                 ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured)
+             }
+@@ -1472,6 +1529,7 @@ impl App {
+                     model: config.model.clone(),
+                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                     otel_manager: otel_manager.clone(),
++                    tap_tx: tap_tx.clone(),
+                 };
+                 ChatWidget::new_from_existing(init, forked.thread, forked.session_configured)
+             }
+@@ -1504,6 +1562,7 @@ impl App {
+             has_emitted_history_lines: false,
+             commit_anim_running: Arc::new(AtomicBool::new(false)),
+             status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
++            tap_tx,
+             backtrack: BacktrackState::default(),
+             backtrack_render_pending: false,
+             feedback: feedback.clone(),
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 7768351..c847970 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -462,6 +462,7 @@ pub(crate) struct ChatWidgetInit {
+     // Shared latch so we only warn once about invalid status-line item IDs.
+     pub(crate) status_line_invalid_items_warned: Arc<AtomicBool>,
+     pub(crate) otel_manager: OtelManager,
++    pub(crate) tap_tx: tokio::sync::broadcast::Sender<String>,
+ }
+ 
+ #[derive(Default)]
+@@ -2750,6 +2751,7 @@ impl ChatWidget {
+             model,
+             status_line_invalid_items_warned,
+             otel_manager,
++            tap_tx,
+         } = common;
+         let model = model.filter(|m| !m.trim().is_empty());
+         let mut config = config;
+@@ -2757,7 +2759,7 @@ impl ChatWidget {
+         let prevent_idle_sleep = config.features.enabled(Feature::PreventIdleSleep);
+         let mut rng = rand::rng();
+         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
+-        let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), thread_manager);
++        let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), thread_manager, tap_tx);
+ 
+         let model_override = model.as_deref();
+         let model_for_header = model
+@@ -2928,6 +2930,7 @@ impl ChatWidget {
+             model,
+             status_line_invalid_items_warned,
+             otel_manager,
++            tap_tx: _,
+         } = common;
+         let model = model.filter(|m| !m.trim().is_empty());
+         let mut config = config;
+@@ -3094,6 +3097,7 @@ impl ChatWidget {
+             model,
+             status_line_invalid_items_warned,
+             otel_manager,
++            tap_tx,
+         } = common;
+         let model = model.filter(|m| !m.trim().is_empty());
+         let prevent_idle_sleep = config.features.enabled(Feature::PreventIdleSleep);
+@@ -3113,7 +3117,7 @@ impl ChatWidget {
+ 
+         let current_cwd = Some(session_configured.cwd.clone());
+         let codex_op_tx =
+-            spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
++            spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone(), tap_tx);
+ 
+         let fallback_default = Settings {
+             model: header_model.clone(),
+diff --git a/codex-rs/tui/src/chatwidget/agent.rs b/codex-rs/tui/src/chatwidget/agent.rs
+index 63d519a..1b21115 100644
+--- a/codex-rs/tui/src/chatwidget/agent.rs
++++ b/codex-rs/tui/src/chatwidget/agent.rs
+@@ -7,6 +7,7 @@ use codex_core::config::Config;
+ use codex_protocol::protocol::Event;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::Op;
++use tokio::sync::broadcast;
+ use tokio::sync::mpsc::UnboundedSender;
+ use tokio::sync::mpsc::unbounded_channel;
+ 
+@@ -19,6 +20,7 @@ pub(crate) fn spawn_agent(
+     config: Config,
+     app_event_tx: AppEventSender,
+     server: Arc<ThreadManager>,
++    tap_tx: broadcast::Sender<String>,
+ ) -> UnboundedSender<Op> {
+     let (codex_op_tx, mut codex_op_rx) = unbounded_channel::<Op>();
+ 
+@@ -62,6 +64,9 @@ pub(crate) fn spawn_agent(
+         });
+ 
+         while let Ok(event) = thread.next_event().await {
++            if let Ok(json) = serde_json::to_string(&event) {
++                let _ = tap_tx.send(json);
++            }
+             let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
+             app_event_tx_clone.send(AppEvent::CodexEvent(event));
+             if is_shutdown_complete {
+@@ -82,6 +87,7 @@ pub(crate) fn spawn_agent_from_existing(
+     thread: std::sync::Arc<CodexThread>,
+     session_configured: codex_protocol::protocol::SessionConfiguredEvent,
+     app_event_tx: AppEventSender,
++    tap_tx: broadcast::Sender<String>,
+ ) -> UnboundedSender<Op> {
+     let (codex_op_tx, mut codex_op_rx) = unbounded_channel::<Op>();
+ 
+@@ -105,6 +111,9 @@ pub(crate) fn spawn_agent_from_existing(
+         });
+ 
+         while let Ok(event) = thread.next_event().await {
++            if let Ok(json) = serde_json::to_string(&event) {
++                let _ = tap_tx.send(json);
++            }
+             let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
+             app_event_tx_clone.send(AppEvent::CodexEvent(event));
+             if is_shutdown_complete {
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+index e6ce131..ccc9c07 100644
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -1580,6 +1580,7 @@ async fn helpers_are_available_and_do_not_panic() {
+         model: Some(resolved_model),
+         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         otel_manager,
++        tap_tx: tokio::sync::broadcast::channel::<String>(1).0,
+     };
+     let mut w = ChatWidget::new(init, thread_manager);
+     // Basic construction sanity.
+@@ -4484,6 +4485,7 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
+         model: Some(resolved_model.clone()),
+         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         otel_manager,
++        tap_tx: tokio::sync::broadcast::channel::<String>(1).0,
+     };
+ 
+     let chat = ChatWidget::new(init, thread_manager);
+@@ -4533,6 +4535,7 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
+         model: Some(resolved_model.clone()),
+         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         otel_manager,
++        tap_tx: tokio::sync::broadcast::channel::<String>(1).0,
+     };
+ 
+     let chat = ChatWidget::new(init, thread_manager);

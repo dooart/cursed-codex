@@ -1,0 +1,12 @@
+# opensrc - source code for packages
+opensrc/
+
+# build artifacts
+vendor/
+
+temp
+node_modules
+__pycache__
+venv
+.DS_Store
+.env
